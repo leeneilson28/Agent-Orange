@@ -1,0 +1,179 @@
+#STEP 1:  INITIAL PULL OF NOTES WITH "sprayed agent orange", "ranch hand", and "chemical corps" IN NOTE TEXT
+
+#All names of data columns, servers, and other locations have been replaced from the following code with generic non-identifying terms
+#change searchterms (line 14 and 78) to "ranch hand" and "chemical corps" for the other initial search steps
+
+
+	oputdir <- "output folder directory"  
+	allIdentifiers <- readRDS("location of RDS file with all possible patient identifiers")
+	con <- odbcDriverConnect(ENTER SERVER AND LOGIN CREDENTIAL INFORMATION HERE)
+
+#split identifiers into smaller groups for manageable durations and intermittent saving
+	fquants <- quantile(allIdentifiers$PatientIdentifier,probs=seq(0,1,0.01))
+
+#put search term in temp SQL table and run
+	searchterms <- c("\"sprayed agent orange\"")
+	searchterms <- paste(searchterms,collapse=" OR ")
+	input_query1 <- "drop table if exists #Search1;";
+	input_query2 <- paste0("Select DISTINCT q.DocumentIdentifier \n 
+		into #Search1 \n from DatabaseName.SQLRecordTextSearch(\'",searchterms,"\') as q");
+	temp<-sqlQuery(con, input_query1);
+	temp<-sqlQuery(con, input_query2);
+
+
+#for each group of patients, grab charts and keep surrounding text
+	options(scipen=999)
+	for (patientGroupIndex in seq(1,length(fquants)-1,1)) {
+	  
+	  Identifiermin <- as.integer(fquants[patientGroupIndex])
+	  Identifiermax <- as.numeric(fquants[patientGroupIndex+1])
+	  print(paste0(Identifiermin, "     ",Identifiermax))
+	  
+	  input_query0 <- "USE [DatabaseName];";
+	  temp<-sqlQuery(con, input_query0);
+	  
+#get PatientIdentifier subset
+	  input_query1 <- "drop table if exists #PtIdentifiers;";
+	  input_query2 <- paste0("Select \n crss.PatientIdentifier,crss.PatientLocalIdentifier,crss.HospitalLocationNumber \n 
+		into #PtIdentifiers \n from DatabaseName.Crosswalk_Between_Identifiers as crss 
+		WHERE cast(PatientIdentifier as bigint) >= ",Identifiermin," AND cast(PatientIdentifier as bigint) <= ",Identifiermax);
+		temp<-sqlQuery(con, input_query1);temp<-sqlQuery(con, input_query2);
+	  
+	  
+#grab text for any notes with the search term
+	  input_query3 <- "
+			  SELECT
+			  crss.PatientIdentifier as PatientIdentifier
+			  ,FORMAT(td.Date_of_document_entry,\'01-MM-yyyy\') as \'Date\'
+			  ,tdd.Document_Definition_Table as \'DocDef\'
+			  ,ssxn.Section_of_Clinical_Service as \'ServiceSxn\'
+			  ,cast(REPLACE(td.Text_From_Individual_Chart,\'\"\',\'\') as varchar(max)) as \'Text\'
+			  FROM #Search1 as tempTab
+				  JOIN SearchableTextDatabaseName  AS td WITH (NOLOCK)  ON td.DocumentIdentifier = tempTab.DocumentIdentifier  
+				  JOIN #PtIdentifiers as crss on (crss.PatientLocalIdentifier = td.PatientLocalIdentifier AND crss.HospitalLocationNumber = td.HospitalLocationNumber)
+				  join GeneralDatabaseName.Descriptors.Document_Definition_Table tdd on tdd.Document_Definition_Identifier = td.Document_Definition_Identifier
+			  JOIN GeneralDatabaseName.Descriptors.Section_of_Clinical_Service as ssxn on 
+				(td.Section_of_Clinical_ServiceLocalID = ssxn.Section_of_Clinical_ServiceLocalID AND td.HospitalLocationNumber = ssxn.HospitalLocationNumber)"
+	  
+	  temp<-sqlQuery(con, input_query3);    
+	  
+	  AOnotes <- temp;rm(temp)
+	  AOnotes$Text <- tolower(AOnotes$Text)
+	  AOnotes$Text <- str_squish(AOnotes$Text)
+	  AOnotes<-distinct(AOnotes,.keep_all=T)
+	  
+	  
+#remove all but text surrounding search term (100 characters in each direction)
+	  if (nrow(AOnotes) > 0) {
+		
+		trimmedText <- as.data.frame(matrix(nrow=nrow(AOnotes),ncol=6))
+		colnames(trimmedText) <- c("PatientIdentifier","Date","DocDef","Service","TextTrimmed","tempFileRow");
+		trimmedText$PatientIdentifier <- as.numeric(trimmedText$PatientIdentifier);
+		trimmedText$DocDef <- as.character(trimmedText$DocDef)
+		trimmedText$Service <- as.character(trimmedText$Service)
+		trimmedText$TextTrimmed <- as.character(trimmedText$TextTrimmed)
+		trimmedText$tempFileRow <- as.integer(trimmedText$tempFileRow)
+		trimmedText$Date <- as.character(trimmedText$Date)
+		
+		
+		keywrd <- "(sprayed agent orange)"
+		
+		
+		nrow_entry <- 0
+		for (j in seq(1,nrow(AOnotes))) {
+		  indices <- gregexpr(paste0(keywrd),AOnotes[j,]$Text,ignore.case=F)
+		  if (!is.na(indices)) { 
+			if (indices[[1]][1] != -1){
+			  for (k in seq(1,length(indices[[1]]))) {
+				indxK <- indices[[1]][k]
+				nrow_entry <- nrow_entry + 1
+				if (nrow_entry > nrow(trimmedText)) {
+				  
+				  trimmedText[nrow_entry + 10000,] <- NA
+				}
+				trimmedText[nrow_entry,]$PatientIdentifier <- AOnotes[j,]$PatientIdentifier
+				trimmedText[nrow_entry,]$Date <- AOnotes[j,]$Date
+				trimmedText[nrow_entry,]$DocDef <- AOnotes[j,]$DocDef
+				trimmedText[nrow_entry,]$Service <- AOnotes[j,]$Service
+				trimmedText[nrow_entry,]$TextTrimmed <- substr(AOnotes[j,]$Text,max(indxK-100,0),min(indxK+100,str_length(AOnotes[j,]$Text)))
+				trimmedText[nrow_entry,]$tempFileRow <- j
+			  }
+			}
+		  }
+		  if ((j %% 1000) == 0 ) {
+			sqlQuery(con,"select top 1 * from #Search1")
+			print(j)
+		  }
+		}
+		trimmedText$Date <- as.Date(trimmedText$Date,format="%d-%m-%Y")
+		trimmedText <- trimmedText[!is.na(trimmedText$PatientIdentifier),]
+		saveRDS(trimmedText,paste0(oputdir,"OUTPUT_FILENAME_OF_NOTES_FOR_EACH_PATIENT_GROUP_",patientGroupIndex,".rds"))
+		rm(trimmedText)
+	  }
+	  
+	  sqlQuery(con,"select top 1 * from #Search1")
+	  
+	}
+	
+#Recombine and save
+	allNoteFrags <- readRDS(paste0(oputdir,"OUTPUT_FILENAME_OF_NOTES_FOR_EACH_PATIENT_GROUP_",1,".rds"))
+	for (patientGroupIndex in seq(2,length(fquants)-1,1)) {
+	  allNoteFrags <- rbind(allNoteFrags,readRDS(paste0(oputdir,"OUTPUT_FILENAME_OF_NOTES_FOR_EACH_PATIENT_GROUP_",patientGroupIndex,".rds")))
+	}
+	allNoteFrags <- distinct(allNoteFrags,.keep_all = T)
+
+	saveRDS(allNoteFrags,paste0(oputdir,"OUTPUTFILENAME_OF_ALL_NOTES.rds"))
+
+
+
+#STEP 2: Cleaning, removing negation, removing mentions of studies, removing ambiguity
+  
+  #_Operation Ranch Hand
+	  allNoteFrags <- readRDS("LOCATION OF RDS FILE WITH ALL NOTE TEXT CONTAINING RANCH HAND")
+	  allNoteFrags <- allNoteFrags[!grepl("operation ranch hand\\?\\) no",allNoteFrags$TextTrimmed,ignore.case=T),]
+	  allNoteFrags <- allNoteFrags[grepl("(operation ranch hand|ranch hand operation)",allNoteFrags$TextTrimmed,ignore.case=T),]
+	  allNoteFrags <- allNoteFrags[!grepl("over the course of operation ranch hand",allNoteFrags$TextTrimmed,ignore.case=T),]
+	  allNoteFrags <- allNoteFrags[!grepl("aerial defoliation program known as operation ranch hand",allNoteFrags$TextTrimmed,ignore.case=T),]
+	  allNoteFrags <- allNoteFrags[!grepl("dioxin was discovered only later\\. however\\, prior to operation ranch hand",allNoteFrags$TextTrimmed,ignore.case=T),]
+	  allNoteFrags <- allNoteFrags[!grepl("who participated in operation ranch hand \\(and other",allNoteFrags$TextTrimmed,ignore.case=T),]
+	  allNoteFrags <- allNoteFrags[!grepl("operation ranch hand veteran cohort study\\. jama",allNoteFrags$TextTrimmed,ignore.case=T),]
+	  allNoteFrags <- allNoteFrags[!grepl("veterans exposed to agent orange\\/dioxin in operation ranch hand",allNoteFrags$TextTrimmed,ignore.case=T),]
+	  allNoteFrags <- allNoteFrags[!grepl("concerning the operation ranch hand medical study report\\,",allNoteFrags$TextTrimmed,ignore.case=T),]
+	  allNoteFrags <- allNoteFrags[!grepl("operation ranch hand study material reviewed",allNoteFrags$TextTrimmed,ignore.case=T),]
+  
+  #__chemical corps
+	  allNoteFrags <- readRDS("LOCATION OF RDS FILE WITH ALL NOTE TEXT CONTAINING CHEMICAL CORPS")
+	  allNoteFrags <- allNoteFrags[grepl("chemical corps",allNoteFrags$TextTrimmed,ignore.case=T),]
+	  ccVets <- distinct(allNoteFrags,PatientIdentifier,.keep_all=T)
+	  ccVets <- ccVets[ccVets$PatientIdentifier %in% People_within_Service_Period$PatientIdentifier | ccVets$PatientIdentifier %in% People_within_Tour_of_Duty$PatientIdentifier ,]
+	  
+  #__ao spray
+	  aoSpray <- readRDS("LOCATION OF RDS FILE WITH ALL NOTE TEXT CONTAINING SPRAYED AGENT ORANGE")
+	  aoSpray <- aoSpray[aoSpray$PatientIdentifier %in% People_within_Service_Period$PatientIdentifier | aoSpray$PatientIdentifier %in% People_within_Tour_of_Duty$PatientIdentifier ,]
+	  
+	  
+	  keywrdA <- "agent"
+	  keywrd <- paste0("(?<!if )(",keywrdA,"\\W(\\w+\\W){0,4}(none\\b|negative\\b)|",keywrdA," denies|",keywrdA,"\\W(\\w+\\W){0,2}no\\b|",
+		keywrdA,"\\W(\\w+\\W){0,5}are not suspected|",keywrdA," but no|",keywrdA," less concerning|",keywrdA," although no |",keywrdA," it is not a diagnostic feature",")")
+	  aoSpray <- aoSpray[!grepl(keywrd,aoSpray$TextTrimmed,perl=T),]
+	  aoSpray <- aoSpray[!grepl("(no not directly sprayed|sprayed agent orange\\: no|sprayed agent orange\\.\\.\\.no|military had sprayed agent orange|worst place they sprayed agent orange)",aoSpray$TextTrimmed,perl=T),]
+	  aoSpray <- aoSpray[!grepl("(sure if he did nothandled or sprayed agent orange|0 agent orange exposure|not certain if he handled|he watched them spray agent|where they would spray agent orange hx)",aoSpray$TextTrimmed,perl=T),]
+	  aoSpray <- aoSpray[!grepl("(where they heavily sprayed agent|jungles as they sprayed agent|in a recently sprayed agent)",aoSpray$TextTrimmed,perl=T),]
+	  
+	  #(keyWrd behind)
+	  keywrd <- paste0("(","no(t)?\\W(\\w+\\W){0,4}(consistent|compatible) with\\W(\\w+\\W){0,4}",keywrdA, "|patient denies\\W(\\w+\\W){0,10}",keywrdA,
+						"|negative for\\W(\\w+\\W){0,2}",keywrdA,"|dont think\\W(\\w+\\W){0,5}",keywrdA,"| or any sx related to ",keywrdA,
+  					   "|does not show any evidence of ",keywrdA," no\\W(\\w+\\W){0,4}to suggest",keywrdA,"|denie(s|d)\\W(\\w+\\W){0,6}",keywrdA,
+					   "|he did not show.*nor the.*seen in",keywrdA,
+					   "|does not have features.*",keywrdA,"|assessment also he did not display.*hallmark of ",keywrdA,"|did not show (\\w+\\W)*features which would suggest ",keywrdA,
+					   "|i do not feel that this represents ",keywrdA,"|not typical for\\W(\\w+\\W)seen in ",keywrdA,"|doubt that he is suffering from\\W(\\w+\\W)+",keywrdA,
+					   "|may decrease likelihood of ",keywrdA,"|cannot also diagnose with ",keywrdA,"|dont see evidence of ",keywrdA,
+					   "|no\\W(\\w+\\W)+that would suggest ",keywrdA,"|do not see a specific evidence for\\W(\\w+\\W)*",keywrdA,"|not cwithwith what is typically seen in",keywrdA,
+					   "|no (clear|noted|obvious|apparent|definite)\\W(\\w+\\W){0,6}",keywrdA,"|does not support sx of\\W(\\w+\\W)*",keywrdA,
+					   "|less likely would be\\W(\\w+\\W)*",keywrdA,"|do not see any concern sx of ",keywrdA,"|ther has ",keywrdA,
+					   "|no other\\W(\\w+\\W)*features of ",keywrdA,")")
+	  aoSpray <- aoSpray[!grepl(keywrd,aoSpray$TextTrimmed,perl=T),]
+	  keywrd <- paste0("(","(unknown|did you handle|did not|unsure|never)\\W(\\w+\\W){0,6}",keywrdA, "|not sure\\W(\\w+\\W){0,4}",keywrdA,
+					   ")")
+	  aoSpray <- aoSpray[!grepl(keywrd,aoSpray$TextTrimmed,perl=T),]
+	  
